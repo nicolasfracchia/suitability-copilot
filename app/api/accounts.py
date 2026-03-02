@@ -1,17 +1,12 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
-from app.db.session import SessionLocal
+
+from app.db.deps import get_db
 from app.models.account import Account
 from app.schemas.account import AccountCreate
 
 router = APIRouter()
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 @router.post("/accounts")
 def create_account(account: AccountCreate, db: Session = Depends(get_db)):
