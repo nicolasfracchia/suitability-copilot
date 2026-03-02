@@ -5,5 +5,6 @@ psycopg2-binary
 alembic
 python-dotenv
 pydantic
+openai
 pytest
 httpx
