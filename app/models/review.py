@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, Integer, String, Numeric, Text, ForeignKey, DateTime
+from sqlalchemy import Boolean, Column, Integer, String, Numeric, Text, ForeignKey, DateTime
 from sqlalchemy.dialects.postgresql import UUID
 
 from app.db.base import Base
@@ -19,6 +19,9 @@ class Review(Base):
     ai_reasoning = Column(Text, nullable=False)
     ai_justification_note = Column(Text, nullable=False)
     model_version = Column(String(50), nullable=False)
+    # Override fields — set when a human changes the effective decision
+    override_flag = Column(Boolean, nullable=False, default=False)
+    override_reason = Column(Text, nullable=True)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
