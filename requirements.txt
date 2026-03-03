@@ -8,3 +8,5 @@ pydantic
 openai
 pytest
 httpx
+celery[redis]
+redis
