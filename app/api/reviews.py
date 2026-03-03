@@ -13,10 +13,7 @@ from app.schemas.review import (
     OverrideRequest,
     OverrideResponse,
 )
-from app.services.llm_service import LLMService, MODEL_VERSION
-from app.services.policy_engine import apply_policy
-from app.services.audit_service import log_event
-from app.services import metrics
+from app.worker.tasks import process_review
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -26,106 +23,46 @@ VALID_DECISIONS = {"AUTO_APPROVED", "ESCALATED", "REJECTED"}
 
 
 @router.post("/accounts/{account_id}/review", response_model=ReviewResponse)
-def review_account(account_id: str, db: Session = Depends(get_db)):
+def trigger_review(account_id: str, db: Session = Depends(get_db)):
     """
-    Full pipeline: LLM → Policy → Persist → Audit.
-
-    All DB writes (review + audit logs) are in ONE transaction.
-    If any step fails — including audit logging — everything rolls back.
+    Triggers a background review for an existing account.
+    
+    🛡 Idempotency Protection:
+    If a review is already PENDING or COMPLETED for this account, returns the existing record.
     """
     account = db.query(Account).filter(Account.id == account_id).first()
     if not account:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    # ── Step 1: LLM Evaluation ─────────────────────────────────────────────
-    service = LLMService()
-    ai_output = service.evaluate(account)
+    # Check for existing review (Idempotency)
+    existing_review = db.query(Review).filter(Review.account_id == account_id).order_by(Review.created_at.desc()).first()
+    if existing_review and existing_review.status in ["PENDING", "COMPLETED"]:
+        logger.info(f"Returning existing review {existing_review.id} for account {account_id} (Idempotency)")
+        return ReviewResponse(
+            review_id=existing_review.id,
+            status=existing_review.status,
+            ai_decision=existing_review.ai_decision,
+            effective_decision=existing_review.effective_decision,
+            confidence=float(existing_review.confidence) if existing_review.confidence else None,
+            reasoning=existing_review.ai_reasoning,
+            model_version=existing_review.model_version,
+        )
 
-    # Track LLM failures (fail-safe output has confidence=0.0 and decision=ESCALATE)
-    if ai_output.confidence == 0.0 and ai_output.decision == "ESCALATE":
-        metrics.increment("llm_failures")
-
-    # ── Step 2: Policy Engine ──────────────────────────────────────────────
-    effective_decision = apply_policy(ai_output)
-
-    logger.info(
-        "Review pipeline | account=%s ai_decision=%s effective_decision=%s confidence=%.2f",
-        account_id,
-        ai_output.decision,
-        effective_decision,
-        ai_output.confidence,
+    # Create new PENDING review
+    review = Review(
+        account_id=account.id,
+        status="PENDING"
     )
+    db.add(review)
+    db.commit()
+    db.refresh(review)
 
-    # ── Step 3: Persist — review + audit logs in one atomic transaction ────
-    try:
-        review = Review(
-            account_id=account.id,
-            suitability_score=ai_output.suitability_score,
-            confidence=ai_output.confidence,
-            ai_decision=ai_output.decision,
-            effective_decision=effective_decision,
-            ai_reasoning=ai_output.reasoning,
-            ai_justification_note=ai_output.justification_note,
-            model_version=MODEL_VERSION,
-            override_flag=False,
-        )
-        db.add(review)
-        db.flush()  # Assigns review.id without committing so we can reference it below
-
-        # Audit: AI Evaluation
-        log_event(
-            db,
-            entity_type="review",
-            entity_id=review.id,
-            event_type="AI_EVALUATED",
-            actor="system",
-            new_value={
-                "suitability_score": ai_output.suitability_score,
-                "confidence": float(ai_output.confidence),
-                "decision": ai_output.decision,
-                "reasoning": ai_output.reasoning,
-                "justification_note": ai_output.justification_note,
-                "model_version": MODEL_VERSION,
-            },
-        )
-
-        # Audit: Policy Application
-        log_event(
-            db,
-            entity_type="review",
-            entity_id=review.id,
-            event_type="POLICY_APPLIED",
-            actor="system",
-            old_value={"ai_decision": ai_output.decision},
-            new_value={"effective_decision": effective_decision},
-        )
-
-        db.commit()
-        db.refresh(review)
-
-    except Exception as exc:
-        db.rollback()
-        logger.error(
-            "Review transaction failed for account %s — rolled back: %s",
-            account_id,
-            exc,
-        )
-        raise HTTPException(status_code=500, detail="Review processing failed. No data was persisted.")
-
-    # ── Step 4: Metrics ────────────────────────────────────────────────────
-    metrics.increment("total_reviews")
-    if effective_decision == "AUTO_APPROVED":
-        metrics.increment("auto_approved")
-    else:
-        metrics.increment("escalated")
+    # Queue background task
+    process_review.delay(str(review.id))
 
     return ReviewResponse(
         review_id=review.id,
-        ai_decision=review.ai_decision,
-        effective_decision=review.effective_decision,
-        confidence=float(review.confidence),
-        reasoning=review.ai_reasoning,
-        model_version=review.model_version,
+        status=review.status
     )
 
 
@@ -137,23 +74,30 @@ def override_review(
 ):
     """
     Human override: change the effective decision without touching AI output.
-
-    AI reasoning is NEVER modified. We only update effective_decision.
-    The override event is written to the audit log in the same transaction.
+    Only works for COMPLETED reviews.
     """
+    review = db.query(Review).filter(Review.id == review_id).first()
+    if not review:
+        raise HTTPException(status_code=404, detail="Review not found")
+    
+    if review.status != "COMPLETED":
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Cannot override a review in state '{review.status}'. It must be COMPLETED."
+        )
+
     if body.new_decision not in VALID_DECISIONS:
         raise HTTPException(
             status_code=422,
             detail=f"new_decision must be one of: {sorted(VALID_DECISIONS)}",
         )
 
-    review = db.query(Review).filter(Review.id == review_id).first()
-    if not review:
-        raise HTTPException(status_code=404, detail="Review not found")
-
     old_decision = review.effective_decision
 
     try:
+        from app.services.audit_service import log_event
+        from app.services import metrics
+        
         review.effective_decision = body.new_decision
         review.override_flag = True
         review.override_reason = body.reason
@@ -173,19 +117,12 @@ def override_review(
 
         db.commit()
         db.refresh(review)
+        metrics.increment("overridden")
 
     except Exception as exc:
         db.rollback()
         logger.error("Override transaction failed for review %s: %s", review_id, exc)
         raise HTTPException(status_code=500, detail="Override failed. No data was changed.")
-
-    metrics.increment("overridden")
-    logger.info(
-        "Human override | review=%s %s → %s",
-        review_id,
-        old_decision,
-        body.new_decision,
-    )
 
     return OverrideResponse(
         review_id=review.id,
@@ -199,8 +136,7 @@ def override_review(
 @router.get("/reviews/{review_id}", response_model=ReviewDetail)
 def get_review(review_id: str, db: Session = Depends(get_db)):
     """
-    Transparency endpoint: full audit record for a review, including
-    whether it was human-overridden and the override reason.
+    Transparency endpoint: returns the review record, supporting polling for async status.
     """
     review = db.query(Review).filter(Review.id == review_id).first()
     if not review:
@@ -209,8 +145,9 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
     return ReviewDetail(
         review_id=review.id,
         account_id=review.account_id,
+        status=review.status,
         suitability_score=review.suitability_score,
-        confidence=float(review.confidence),
+        confidence=float(review.confidence) if review.confidence else None,
         ai_decision=review.ai_decision,
         effective_decision=review.effective_decision,
         reasoning=review.ai_reasoning,
@@ -224,7 +161,8 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
 
 @router.get("/reviews", response_model=list[ReviewDetail])
 def list_reviews(
-    decision: Optional[str] = Query(None, description="Filter by effective_decision (e.g. ESCALATED, AUTO_APPROVED)"),
+    decision: Optional[str] = Query(None, description="Filter by effective_decision"),
+    status: Optional[str] = Query(None, description="Filter by status (PENDING, COMPLETED, FAILED)"),
     db: Session = Depends(get_db),
 ):
     """
@@ -237,14 +175,18 @@ def list_reviews(
     query = db.query(Review)
     if decision:
         query = query.filter(Review.effective_decision == decision.upper())
+    if status:
+        query = query.filter(Review.status == status.upper())
+    
     reviews = query.order_by(Review.created_at.desc()).all()
 
     return [
         ReviewDetail(
             review_id=r.id,
             account_id=r.account_id,
+            status=r.status,
             suitability_score=r.suitability_score,
-            confidence=float(r.confidence),
+            confidence=float(r.confidence) if r.confidence else None,
             ai_decision=r.ai_decision,
             effective_decision=r.effective_decision,
             reasoning=r.ai_reasoning,
