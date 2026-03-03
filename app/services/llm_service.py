@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from app.core.config import settings
 from app.schemas.ai_output import AIReviewOutput
 
@@ -7,10 +8,14 @@ logger = logging.getLogger(__name__)
 # Required at module-level to prevent MagicMock attribute error in tests.
 MODEL_VERSION = "gpt-4o"
 
+# Limit concurrent LLM calls to prevent rate limits or resource exhaustion.
+llm_semaphore = asyncio.Semaphore(5)
+
 class LLMService:
     """
     Wraps an OpenAI chat completion call with prompt engineering,
     strict JSON validation, and a fail-safe fallback.
+    Now fully asynchronous with semaphore-based rate limiting.
 
     Design contract:
       - evaluate() ALWAYS returns an AIReviewOutput.
@@ -22,21 +27,22 @@ class LLMService:
     MODEL_VERSION = MODEL_VERSION 
 
     def __init__(self):
-        import openai
-        self._client = openai.OpenAI(api_key=settings.OPENAI_API_KEY)
+        from openai import AsyncOpenAI
+        self._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
 
-    def evaluate(self, account) -> AIReviewOutput:
-        try:
-            messages = self._build_prompt(account)
-            raw = self._call_model(messages)
-            return self._parse_and_validate(raw)
-        except Exception as exc:
-            logger.error(
-                "LLM evaluation failed for account %s — applying fail-safe escalation: %s",
-                getattr(account, "id", "unknown"),
-                exc,
-            )
-            return self._fail_safe()
+    async def evaluate(self, account) -> AIReviewOutput:
+        async with llm_semaphore:
+            try:
+                messages = self._build_prompt(account)
+                raw = await self._call_model(messages)
+                return self._parse_and_validate(raw)
+            except Exception as exc:
+                logger.error(
+                    "LLM evaluation failed for account %s — applying fail-safe escalation: %s",
+                    getattr(account, "id", "unknown"),
+                    exc,
+                )
+                return self._fail_safe()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -80,13 +86,14 @@ class LLMService:
             {"role": "user", "content": user_prompt},
         ]
 
-    def _call_model(self, messages: list[dict]) -> str:
-        response = self._client.chat.completions.create(
+    async def _call_model(self, messages: list[dict]) -> str:
+        # Added strict 10s timeout to model calls as per production hardening
+        response = await self._client.chat.completions.create(
             model=self.MODEL_VERSION,
             messages=messages,
             response_format={"type": "json_object"},
             temperature=0.1,
-            timeout=30,
+            timeout=10,
         )
         return response.choices[0].message.content
 
