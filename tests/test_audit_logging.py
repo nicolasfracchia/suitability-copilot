@@ -61,10 +61,10 @@ def _get_audit_logs(review_id: str) -> list[dict]:
         db.close()
 
 
-@patch("app.api.reviews.LLMService")
-def test_ai_evaluated_audit_event_created(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_ai_evaluated_audit_event_created(mock_evaluate):
     """After a review, an AI_EVALUATED audit log must exist."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -84,10 +84,10 @@ def test_ai_evaluated_audit_event_created(MockLLMService):
     assert ai_log.old_value is None  # No prior state for AI evaluation
 
 
-@patch("app.api.reviews.LLMService")
-def test_policy_applied_audit_event_created(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_policy_applied_audit_event_created(mock_evaluate):
     """After a review, a POLICY_APPLIED audit log must exist."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -105,10 +105,10 @@ def test_policy_applied_audit_event_created(MockLLMService):
     assert policy_log.new_value["effective_decision"] == "AUTO_APPROVED"
 
 
-@patch("app.api.reviews.LLMService")
-def test_both_audit_events_created_in_order(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_both_audit_events_created_in_order(mock_evaluate):
     """Both AI_EVALUATED and POLICY_APPLIED must be present, in that order."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -125,10 +125,10 @@ def test_both_audit_events_created_in_order(MockLLMService):
     assert policy_log.new_value["effective_decision"] == "ESCALATED"
 
 
-@patch("app.api.reviews.LLMService")
-def test_audit_logs_are_immutable_insert_only(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_audit_logs_are_immutable_insert_only(mock_evaluate):
     """Audit logs are created but never modified — they're append-only."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")

@@ -18,9 +18,9 @@ MOCK_MISMATCH = AIReviewOutput(
 )
 
 
-@patch("app.api.reviews.LLMService")
-def test_full_review_flow(MockLLMService):
-    MockLLMService.return_value.evaluate.return_value = MOCK_MISMATCH
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_full_review_flow(mock_evaluate):
+    mock_evaluate.return_value = MOCK_MISMATCH
 
     account_data = {
         "age": 30,

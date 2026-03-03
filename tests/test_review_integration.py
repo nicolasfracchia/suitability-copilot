@@ -50,9 +50,10 @@ def _create_account(risk_tolerance="Medium", investment_choice="Balanced fund"):
     return res.json()["account_id"]
 
 
-@patch("app.api.reviews.LLMService")
-def test_high_confidence_approve_returns_auto_approved(MockLLMService):
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_high_confidence_approve_returns_auto_approved(mock_evaluate):
+    """Profile with high suitability and high confidence must be AUTO_APPROVED."""
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -66,9 +67,10 @@ def test_high_confidence_approve_returns_auto_approved(MockLLMService):
     assert data["model_version"] is not None
 
 
-@patch("app.api.reviews.LLMService")
-def test_escalate_decision_returns_escalated(MockLLMService):
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_escalate_decision_returns_escalated(mock_evaluate):
+    """LLM decision ESCALATE must be reflected in effective_decision."""
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -79,10 +81,10 @@ def test_escalate_decision_returns_escalated(MockLLMService):
     assert data["effective_decision"] == "ESCALATED"
 
 
-@patch("app.api.reviews.LLMService")
-def test_block_decision_is_escalated_not_auto_blocked(MockLLMService):
-    """Even BLOCK at 0.99 confidence must never auto-block — it must escalate."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_BLOCK
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_block_decision_is_escalated_not_auto_blocked(mock_evaluate):
+    """LLM decision BLOCK must be escalated for human review (never auto-blocked)."""
+    mock_evaluate.return_value = MOCK_BLOCK
 
     account_id = _create_account()
     res = client.post(f"/accounts/{account_id}/review")
@@ -91,10 +93,10 @@ def test_block_decision_is_escalated_not_auto_blocked(MockLLMService):
     assert res.json()["effective_decision"] == "ESCALATED"
 
 
-@patch("app.api.reviews.LLMService")
-def test_review_stored_and_retrievable_via_get(MockLLMService):
-    """End-to-end: create → review → GET /reviews/{id} returns full detail."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_review_stored_and_retrievable_via_get(mock_evaluate):
+    """Generated review must be saved to DB and retrievable by ID."""
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")

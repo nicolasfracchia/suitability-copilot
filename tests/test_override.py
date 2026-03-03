@@ -62,10 +62,10 @@ def _get_audit_logs(review_id: str) -> list:
         db.close()
 
 
-@patch("app.api.reviews.LLMService")
-def test_override_changes_effective_decision(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_override_changes_effective_decision(mock_evaluate):
     """Override must change effective_decision to the requested value."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")
@@ -84,10 +84,10 @@ def test_override_changes_effective_decision(MockLLMService):
     assert data["actor"] == "admin_user"
 
 
-@patch("app.api.reviews.LLMService")
-def test_override_preserves_ai_reasoning(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_override_preserves_ai_reasoning(mock_evaluate):
     """AI decision and reasoning must NEVER be modified by an override."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")
@@ -112,10 +112,10 @@ def test_override_preserves_ai_reasoning(MockLLMService):
     assert detail["effective_decision"] == "AUTO_APPROVED"
 
 
-@patch("app.api.reviews.LLMService")
-def test_override_sets_override_flag(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_override_sets_override_flag(mock_evaluate):
     """After an override, override_flag must be True and override_reason must be set."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")
@@ -134,10 +134,10 @@ def test_override_sets_override_flag(MockLLMService):
     assert detail["override_reason"] == override_reason
 
 
-@patch("app.api.reviews.LLMService")
-def test_override_creates_human_override_audit_log(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_override_creates_human_override_audit_log(mock_evaluate):
     """Override must create a HUMAN_OVERRIDE audit event with correct values."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    mock_evaluate.return_value = MOCK_ESCALATE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")
@@ -160,10 +160,10 @@ def test_override_creates_human_override_audit_log(MockLLMService):
     assert override_log.new_value["reason"] == "Compliance team confirmed hard block."
 
 
-@patch("app.api.reviews.LLMService")
-def test_override_not_overridden_review_has_flag_false(MockLLMService):
+@patch("app.services.llm_service.LLMService.evaluate")
+def test_override_not_overridden_review_has_flag_false(mock_evaluate):
     """A review that was NOT overridden must have override_flag=False."""
-    MockLLMService.return_value.evaluate.return_value = MOCK_APPROVE
+    mock_evaluate.return_value = MOCK_APPROVE
 
     account_id = _create_account()
     review_res = client.post(f"/accounts/{account_id}/review")
@@ -179,8 +179,8 @@ def test_override_not_overridden_review_has_flag_false(MockLLMService):
 def test_override_invalid_decision_rejected():
     """Invalid new_decision values must return 422."""
     # Create a minimal review to get a real review_id
-    with patch("app.api.reviews.LLMService") as MockLLMService:
-        MockLLMService.return_value.evaluate.return_value = MOCK_ESCALATE
+    with patch("app.services.llm_service.LLMService.evaluate") as mock_evaluate:
+        mock_evaluate.return_value = MOCK_ESCALATE
         account_res = client.post("/accounts", json={
             "age": 30, "income": 50000.0, "net_worth": 20000.0,
             "risk_tolerance": "Low", "investment_choice": "Bonds",

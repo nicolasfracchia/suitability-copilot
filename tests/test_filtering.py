@@ -32,8 +32,8 @@ MOCK_ESCALATE = AIReviewOutput(
 
 def _create_account_and_review(mock_output: AIReviewOutput) -> dict:
     """Helper: create an account and trigger a review with the given mock output."""
-    with patch("app.api.reviews.LLMService") as MockLLMService:
-        MockLLMService.return_value.evaluate.return_value = mock_output
+    with patch("app.services.llm_service.LLMService.evaluate") as mock_evaluate:
+        mock_evaluate.return_value = mock_output
 
         account_res = client.post("/accounts", json={
             "age": 35,
