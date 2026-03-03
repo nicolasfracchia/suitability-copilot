@@ -6,23 +6,25 @@ from typing import Optional
 
 class ReviewResponse(BaseModel):
     review_id: UUID
-    ai_decision: str
-    effective_decision: str
-    confidence: float
-    reasoning: str
-    model_version: str
+    status: str
+    ai_decision: Optional[str] = None
+    effective_decision: Optional[str] = None
+    confidence: Optional[float] = None
+    reasoning: Optional[str] = None
+    model_version: Optional[str] = None
 
 
 class ReviewDetail(BaseModel):
     review_id: UUID
     account_id: UUID
-    suitability_score: int
-    confidence: float
-    ai_decision: str
-    effective_decision: str
-    reasoning: str
-    justification_note: str
-    model_version: str
+    status: str
+    suitability_score: Optional[int] = None
+    confidence: Optional[float] = None
+    ai_decision: Optional[str] = None
+    effective_decision: Optional[str] = None
+    reasoning: Optional[str] = None
+    justification_note: Optional[str] = None
+    model_version: Optional[str] = None
     override_flag: bool
     override_reason: Optional[str] = None
     created_at: datetime
