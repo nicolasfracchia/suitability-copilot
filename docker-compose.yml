@@ -1,55 +1,93 @@
+name: suitability-copilot
+
+# Every value below has a working default, so `docker compose up --build` runs on a
+# bare clone with no .env file present. Compose automatically reads .env from the
+# project directory for interpolation when it exists, so dropping a real
+# OPENAI_API_KEY into .env is all that's needed to switch from the stub reviewer
+# to the live model — no compose changes, no extra flags.
+x-app-env: &app-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-copilot}
+  REDIS_URL: redis://redis:6379/0
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
 services:
   db:
-    image: postgres:15
+    image: postgres:15-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: copilot
-    ports:
-      - "5432:5432"
-    networks:
-      - app-network
-
-  api:
-    build: ./
-    depends_on:
-      - db
-      - redis
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-copilot}
     volumes:
-      - .:/app
-    networks:
-      - app-network
-    command: >
-      bash -c "
-        echo 'Running migrations...' &&
-        alembic upgrade head &&
-        echo 'Starting FastAPI application...' &&
-        uvicorn app.main:app --reload --port 8000 --host 0.0.0.0
-      "
+      - pgdata:/var/lib/postgresql/data
+    # Bound to loopback only: reachable via psql from this machine, not from the LAN.
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-copilot}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [app-network]
 
   redis:
-    image: redis:7
+    image: redis:7-alpine
+    # Not published to the host: only the api and worker containers need it.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    networks: [app-network]
+
+  # One-shot migration job. Both api and worker wait for it to exit 0, which
+  # removes the start-order race that made the old stack fail intermittently.
+  migrate:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment: *app-env
+    command: alembic upgrade head
+    restart: "no"
+    networks: [app-network]
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment: *app-env
     ports:
-      - "6379:6379"
-    networks:
-      - app-network
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [app-network]
 
   worker:
-    build: ./
+    build: .
     depends_on:
-      - db
-      - redis
-    env_file:
-      - .env
-    volumes:
-      - .:/app
-    networks:
-      - app-network
-    command: celery -A app.worker.celery worker --loglevel=info
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment: *app-env
+    command: celery -A app.worker.celery worker --loglevel=INFO
+    networks: [app-network]
+
+volumes:
+  pgdata:
 
 networks:
   app-network:

@@ -1,0 +1,18 @@
+# Development overlay: live-reload against the host source tree.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+# Deliberately NOT named docker-compose.override.yml — Compose auto-loads that
+# filename, which would silently apply --reload and bind mounts to the default
+# `docker compose up` that the README advertises.
+services:
+  api:
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    volumes:
+      - .:/app
+    # Celery has no native reload; restart the container to pick up task changes.
+    command: celery -A app.worker.celery worker --loglevel=DEBUG

@@ -1,7 +1,12 @@
-# Secrets — .env.example is the only env file that belongs in git.
+# Secrets — must never enter an image layer.
 .env
 .env.*
 !.env.example
+
+# Version control
+.git
+.gitignore
+.github
 
 # Python bytecode & caches
 __pycache__/
@@ -17,8 +22,12 @@ htmlcov/
 .venv/
 venv/
 
-# Editor / OS
+# Local tooling / editor state
 .vscode/
 .idea/
 *.swp
 .DS_Store
+
+# Docs & compose files aren't needed at runtime
+docs/
+docker-compose*.yml

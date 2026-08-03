@@ -1,12 +1,25 @@
-fastapi
-uvicorn[standard]
-sqlalchemy
-psycopg2-binary
-alembic
-python-dotenv
-pydantic
-openai
-pytest
-httpx
-celery[redis]
-redis
+# Pinned for reproducible builds. Bump deliberately, not incidentally.
+
+# --- Web layer ---
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# --- Persistence ---
+sqlalchemy==2.0.36
+psycopg2-binary==2.9.10
+alembic==1.14.0
+
+# --- Async pipeline ---
+celery[redis]==5.4.0
+redis==5.2.1
+
+# --- Model provider & config ---
+openai==1.59.6
+pydantic==2.10.4
+python-dotenv==1.0.1
+
+# --- Test suite ---
+# Kept in the runtime image on purpose: the documented way to run the suite is
+# `docker compose run --rm api pytest`, against the same image the app runs in.
+pytest==8.3.4
+httpx==0.28.1
