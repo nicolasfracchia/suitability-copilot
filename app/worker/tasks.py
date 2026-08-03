@@ -1,27 +1,28 @@
-import logging
 import asyncio
+
 from celery.utils.log import get_task_logger
-from app.worker.celery import celery
+
 from app.db.session import SessionLocal
 from app.models.account import Account
 from app.models.review import Review
-from app.services.llm_service import LLMService, MODEL_VERSION
-from app.services.policy_engine import apply_policy
 from app.services.audit_service import log_event
-from app.services import metrics
+from app.services.llm_service import LLMService
+from app.services.policy_engine import apply_policy
+from app.worker.celery import celery
 
 logger = get_task_logger(__name__)
+
 
 @celery.task(bind=True, max_retries=3)
 def process_review(self, review_id: str):
     """
     Background Task: Executes the full AI suitability review pipeline.
-    
+
     Flow:
     1. Fetch Review from DB
-    2. Run Async LLM Evaluation
+    2. Run the configured review provider (OpenAI or deterministic stub)
     3. Run Policy Engine
-    4. Update Review & Write Audit Logs
+    4. Update Review & Write Audit Logs in one transaction
     5. Handle Retries/Failures
     """
     db = SessionLocal()
@@ -43,20 +44,18 @@ def process_review(self, review_id: str):
             db.commit()
             return
 
-        # ── Step 1: Async LLM Evaluation ───────────────────────────────────
+        # ── Step 1: Evaluation ─────────────────────────────────────────────
         service = LLMService()
-        # Run the async evaluation in the sync worker thread
+        # The provider API is async; the Celery worker is sync.
         ai_output = asyncio.run(service.evaluate(account))
-
-        # Track LLM failures (fail-safe output has confidence=0.0 and decision=ESCALATE)
-        if ai_output.confidence == 0.0 and ai_output.decision == "ESCALATE":
-            metrics.increment("llm_failures")
+        model_version = service.model_version
 
         # ── Step 2: Policy Engine ──────────────────────────────────────────
         effective_decision = apply_policy(ai_output)
 
         logger.info(
-            f"Background Review | review={review_id} ai_decision={ai_output.decision} effective_decision={effective_decision}"
+            f"Background Review | review={review_id} model={model_version} "
+            f"ai_decision={ai_output.decision} effective_decision={effective_decision}"
         )
 
         # ── Step 3: Update Review ──────────────────────────────────────────
@@ -66,11 +65,12 @@ def process_review(self, review_id: str):
         review.effective_decision = effective_decision
         review.ai_reasoning = ai_output.reasoning
         review.ai_justification_note = ai_output.justification_note
-        review.model_version = MODEL_VERSION
+        review.model_version = model_version
         review.status = "COMPLETED"
 
         # ── Step 4: Audit Logs ─────────────────────────────────────────────
-        # Audit: AI Evaluation
+        # Same transaction as the update above: if the audit write fails, the
+        # review update rolls back with it.
         log_event(
             db,
             entity_type="review",
@@ -83,11 +83,10 @@ def process_review(self, review_id: str):
                 "decision": ai_output.decision,
                 "reasoning": ai_output.reasoning,
                 "justification_note": ai_output.justification_note,
-                "model_version": MODEL_VERSION,
+                "model_version": model_version,
             },
         )
 
-        # Audit: Policy Application
         log_event(
             db,
             entity_type="review",
@@ -98,39 +97,49 @@ def process_review(self, review_id: str):
             new_value={"effective_decision": effective_decision},
         )
 
+        # Persists the review update and both audit rows together. Pipeline
+        # metrics are derived from these rows at read time, so there is no
+        # separate counter to increment here.
         db.commit()
-
-        # ── Step 5: Metrics ────────────────────────────────────────────────
-        metrics.increment("total_reviews")
-        if effective_decision == "AUTO_APPROVED":
-            metrics.increment("auto_approved")
-        else:
-            metrics.increment("escalated")
 
     except Exception as exc:
         db.rollback()
         logger.warning(f"Task failed for review {review_id}, checking for retry: {exc}")
-        
+
         # If we have retries left, trigger one
         if self.request.retries < self.max_retries:
             raise self.retry(exc=exc, countdown=5)
-        else:
-            # Final failure after 3 retries
-            logger.error(f"Max retries reached for review {review_id}")
-            review = db.query(Review).filter(Review.id == review_id).first()
-            if review:
-                review.status = "FAILED"
-                db.commit()
-                
-                # Audit the failure
-                log_event(
-                    db,
-                    entity_type="review",
-                    entity_id=review.id,
-                    event_type="REVIEW_FAILED",
-                    actor="system",
-                    new_value={"error": str(exc), "retries": self.max_retries},
-                )
-                db.commit()
+
+        # Final failure after the retry budget is exhausted.
+        logger.error(f"Max retries reached for review {review_id}")
+        _mark_failed(db, review_id, exc, self.max_retries)
     finally:
         db.close()
+
+
+def _mark_failed(db, review_id: str, exc: Exception, retries: int) -> None:
+    """
+    Record terminal failure. The status change and its audit row share one
+    transaction — a FAILED review must never exist without an audit trail.
+    """
+    try:
+        review = db.query(Review).filter(Review.id == review_id).first()
+        if not review:
+            return
+
+        review.status = "FAILED"
+        log_event(
+            db,
+            entity_type="review",
+            entity_id=review.id,
+            event_type="REVIEW_FAILED",
+            actor="system",
+            new_value={"error": str(exc), "retries": retries},
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Could not record terminal failure for review %s; it remains PENDING for reprocessing.",
+            review_id,
+        )
