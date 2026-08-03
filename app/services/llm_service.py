@@ -1,109 +1,75 @@
-import logging
 import asyncio
-from app.core.config import settings
+import logging
+import weakref
+
 from app.schemas.ai_output import AIReviewOutput
+from app.services.providers import get_provider
 
 logger = logging.getLogger(__name__)
 
-# Required at module-level to prevent MagicMock attribute error in tests.
-MODEL_VERSION = "gpt-4o"
+# Ceiling on evaluations running concurrently inside a single event loop.
+# Note this is not the primary scaling control: the Celery worker runs one
+# asyncio.run() per task, so cross-task concurrency is governed by the worker's
+# own concurrency/prefetch settings (see app/worker/celery.py). This semaphore
+# guards the case where several evaluations share one loop.
+MAX_CONCURRENT_EVALUATIONS = 5
 
-# Limit concurrent LLM calls to prevent rate limits or resource exhaustion.
-llm_semaphore = asyncio.Semaphore(5)
+# Keyed by event loop: asyncio primitives bind to the first loop that awaits
+# them, and every Celery task creates a fresh loop via asyncio.run(). A single
+# module-level semaphore would eventually raise "bound to a different event
+# loop" once it saw contention.
+_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _semaphores.get(loop)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_EVALUATIONS)
+        _semaphores[loop] = semaphore
+    return semaphore
+
 
 class LLMService:
     """
-    Wraps an OpenAI chat completion call with prompt engineering,
-    strict JSON validation, and a fail-safe fallback.
-    Now fully asynchronous with semaphore-based rate limiting.
+    Facade over the configured review provider.
 
     Design contract:
       - evaluate() ALWAYS returns an AIReviewOutput.
-      - On ANY failure (timeout, bad JSON, validation error), it returns
-        a fail-safe ESCALATE result with confidence=0.0 so that the
-        policy engine never auto-approves under uncertainty.
+      - On ANY failure (timeout, bad JSON, validation error, provider crash) it
+        returns a fail-safe ESCALATE result with confidence=0.0, so the policy
+        engine can never auto-approve under uncertainty.
+
+    The fail-safe lives here rather than in the providers so that adding a
+    provider cannot introduce a path that bypasses it.
     """
 
-    MODEL_VERSION = MODEL_VERSION 
+    def __init__(self, provider=None):
+        self._provider = provider if provider is not None else get_provider()
 
-    def __init__(self):
-        from openai import AsyncOpenAI
-        self._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+    @property
+    def model_version(self) -> str:
+        """Identifier of the reviewer that actually produced the assessment."""
+        return self._provider.model_version
 
     async def evaluate(self, account) -> AIReviewOutput:
-        async with llm_semaphore:
+        async with _get_semaphore():
             try:
-                messages = self._build_prompt(account)
-                raw = await self._call_model(messages)
-                return self._parse_and_validate(raw)
+                return await self._provider.review(account)
             except Exception as exc:
                 logger.error(
-                    "LLM evaluation failed for account %s — applying fail-safe escalation: %s",
+                    "Review evaluation failed for account %s via %s — applying fail-safe escalation: %s",
                     getattr(account, "id", "unknown"),
+                    self.model_version,
                     exc,
                 )
                 return self._fail_safe()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _build_prompt(self, account) -> list[dict]:
-        system_prompt = (
-            "You are a licensed financial suitability analyst AI. "
-            "Your task is to evaluate a client's investment profile and produce a suitability assessment.\n\n"
-            "You MUST respond with a single valid JSON object only — no prose, no markdown, no code fences.\n"
-            "The JSON must conform exactly to this schema:\n"
-            '{"suitability_score": <integer 0-100>, '
-            '"confidence": <float 0.0-1.0>, '
-            '"decision": <"APPROVE"|"ESCALATE"|"BLOCK">, '
-            '"reasoning": <string explaining the assessment>, '
-            '"justification_note": <short client-facing summary>}\n\n'
-            "Decision guidelines:\n"
-            "  APPROVE   — profile is internally consistent and suitable.\n"
-            "  ESCALATE  — profile has concerns that require human review.\n"
-            "  BLOCK     — profile contains a clear regulatory red flag.\n\n"
-            "Example response:\n"
-            '{"suitability_score": 72, "confidence": 0.91, "decision": "APPROVE", '
-            '"reasoning": "Client demonstrates a balanced risk profile consistent with the selected strategy.", '
-            '"justification_note": "Risk tolerance aligns with the chosen investment vehicle."}'
-        )
-
-        user_prompt = (
-            "Evaluate the following client profile:\n"
-            f"  Age:                {account.age}\n"
-            f"  Annual income:      ${float(account.income):,.2f}\n"
-            f"  Net worth:          ${float(account.net_worth):,.2f}\n"
-            f"  Risk tolerance:     {account.risk_tolerance}\n"
-            f"  Investment choice:  {account.investment_choice}\n"
-            f"  Investment horizon: {account.investment_horizon} years\n"
-            f"  Notes:              {account.notes or 'None'}\n\n"
-            "Return ONLY the JSON object."
-        )
-
-        return [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-    async def _call_model(self, messages: list[dict]) -> str:
-        # Added strict 10s timeout to model calls as per production hardening
-        response = await self._client.chat.completions.create(
-            model=self.MODEL_VERSION,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.1,
-            timeout=10,
-        )
-        return response.choices[0].message.content
-
-    def _parse_and_validate(self, raw: str) -> AIReviewOutput:
-        """Raises pydantic.ValidationError if the model output is non-conforming."""
-        return AIReviewOutput.model_validate_json(raw)
-
     def _fail_safe(self) -> AIReviewOutput:
         """
-        Returned whenever the LLM pipeline raises any exception.
+        Returned whenever the evaluation pipeline raises.
         Confidence=0.0 guarantees the policy engine will ESCALATE.
         Never auto-approve on model uncertainty.
         """
@@ -112,7 +78,7 @@ class LLMService:
             confidence=0.0,
             decision="ESCALATE",
             reasoning=(
-                "LLM evaluation failed — defaulting to manual escalation. "
+                "Automated evaluation failed — defaulting to manual escalation. "
                 "This is a fail-safe response; no automated decision was made."
             ),
             justification_note=(
