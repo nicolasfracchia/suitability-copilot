@@ -8,4 +8,4 @@ class AccountCreate(BaseModel):
     risk_tolerance: str
     investment_choice: str
     investment_horizon: int
-    notes: Optional[str]
+    notes: Optional[str] = None

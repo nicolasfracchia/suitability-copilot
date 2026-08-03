@@ -22,6 +22,16 @@ router = APIRouter()
 VALID_DECISIONS = {"AUTO_APPROVED", "ESCALATED", "REJECTED"}
 
 
+def _as_float(value) -> Optional[float]:
+    """
+    Convert a Numeric column to float, preserving 0.0.
+
+    A truthiness check here would erase the fail-safe confidence of exactly
+    0.0 — the one value that most needs to reach the reviewer.
+    """
+    return float(value) if value is not None else None
+
+
 @router.post("/accounts/{account_id}/review", response_model=ReviewResponse)
 def trigger_review(account_id: str, db: Session = Depends(get_db)):
     """
@@ -43,7 +53,7 @@ def trigger_review(account_id: str, db: Session = Depends(get_db)):
             status=existing_review.status,
             ai_decision=existing_review.ai_decision,
             effective_decision=existing_review.effective_decision,
-            confidence=float(existing_review.confidence) if existing_review.confidence else None,
+            confidence=_as_float(existing_review.confidence),
             reasoning=existing_review.ai_reasoning,
             model_version=existing_review.model_version,
         )
@@ -96,8 +106,7 @@ def override_review(
 
     try:
         from app.services.audit_service import log_event
-        from app.services import metrics
-        
+
         review.effective_decision = body.new_decision
         review.override_flag = True
         review.override_reason = body.reason
@@ -117,7 +126,6 @@ def override_review(
 
         db.commit()
         db.refresh(review)
-        metrics.increment("overridden")
 
     except Exception as exc:
         db.rollback()
@@ -147,7 +155,7 @@ def get_review(review_id: str, db: Session = Depends(get_db)):
         account_id=review.account_id,
         status=review.status,
         suitability_score=review.suitability_score,
-        confidence=float(review.confidence) if review.confidence else None,
+        confidence=_as_float(review.confidence),
         ai_decision=review.ai_decision,
         effective_decision=review.effective_decision,
         reasoning=review.ai_reasoning,
@@ -186,7 +194,7 @@ def list_reviews(
             account_id=r.account_id,
             status=r.status,
             suitability_score=r.suitability_score,
-            confidence=float(r.confidence) if r.confidence else None,
+            confidence=_as_float(r.confidence),
             ai_decision=r.ai_decision,
             effective_decision=r.effective_decision,
             reasoning=r.ai_reasoning,
