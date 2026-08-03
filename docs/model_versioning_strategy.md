@@ -10,20 +10,20 @@ This document defines how the AI model version is tracked per review, how behavi
 
 Every review record in the `reviews` table includes a `model_version` column (`VARCHAR(50)`).
 
-- **Set at evaluation time**: The value is sourced from the `MODEL_VERSION` constant defined at the top of `app/services/llm_service.py`:
-  ```python
-  MODEL_VERSION = "gpt-4o"
-  ```
+- **Set at evaluation time**: The value is reported by the provider that actually produced the assessment, via `LLMService.model_version` (see `app/services/providers/`). For the OpenAI provider this is the configured `OPENAI_MODEL` (default `gpt-4o`); for the offline stub reviewer it is `stub-v1`.
+- **Never conflated**: Because the identifier comes from the provider rather than a shared constant, stub-generated reviews can never be mistaken for model-generated ones in the audit trail or in the drift queries below. Exclude `stub-v1` when analysing production behaviour.
 - **Immutable per review**: Once a review is written to the DB, its `model_version` is never updated, even if the service is upgraded. This gives a permanent record of which model produced which decision.
-- **Promoted via deployment**: To upgrade models, update the constant and redeploy. All reviews created after the deployment will carry the new version string.
+- **Promoted via deployment**: To upgrade models, change `OPENAI_MODEL` and redeploy. All reviews created after the deployment will carry the new version string.
 
 ### Querying by Version
 
 ```sql
--- Compare decision distributions across model versions
+-- Compare decision distributions across model versions.
+-- Excludes the offline stub reviewer, which is not a model.
 SELECT model_version, effective_decision, COUNT(*) as count
 FROM reviews
 WHERE status = 'COMPLETED'
+  AND model_version <> 'stub-v1'
 GROUP BY model_version, effective_decision
 ORDER BY model_version, effective_decision;
 ```
@@ -32,19 +32,23 @@ ORDER BY model_version, effective_decision;
 
 ## 2. How Drift Is Monitored
 
-### Short-term (In-Memory Metrics)
+### Short-term (`GET /metrics`)
 
-Exposed via `GET /metrics`, the counters track aggregate pipeline behavior:
+Aggregated from the `reviews` table on each call, so the figures are consistent across the API and worker processes and survive restarts:
 
-| Counter | What it signals |
+| Field | What it signals |
 |---|---|
-| `total_reviews` | Overall throughput |
-| `auto_approved` | Auto-approval rate |
-| `escalated` | Escalation rate |
-| `llm_failures` | Fail-safe escalations (model errors) |
-| `overridden` | Human correction rate |
+| `total_reviews` / `completed` / `pending` / `failed` | Throughput and queue health |
+| `auto_approved` | Auto-approval volume |
+| `escalated` | Escalation volume |
+| `llm_failures` | Fail-safe escalations plus terminal task failures |
+| `overridden` | Human correction volume |
+| `auto_approval_rate` | `auto_approved / completed` — the primary drift signal |
+| `override_rate` | `overridden / completed` — how often humans disagree |
 
-A sudden shift in `auto_approved` vs `escalated` ratios after a model update is a primary drift signal.
+A sudden shift in `auto_approval_rate` or `override_rate` after a model update is a primary drift signal.
+
+Because these are aggregates over all time, they lag: a change in recent behavior is diluted by history. Use the SQL below for windowed comparisons, and treat `/metrics` as a liveness view rather than a drift detector on its own.
 
 ### Long-term (Database Aggregation)
 
@@ -83,8 +87,8 @@ Before promoting, run a shadow deployment on 5–10% of live traffic (or a sampl
 
 ### Step 4: Document on Deploy
 
-When promoting a new `MODEL_VERSION`:
-1. Update the constant in `llm_service.py`.
+When promoting a new model version:
+1. Update `OPENAI_MODEL` in the deployment environment.
 2. Add an entry to `CHANGELOG.md` with version string, date, and reason.
 3. Archive baseline regression results.
 
