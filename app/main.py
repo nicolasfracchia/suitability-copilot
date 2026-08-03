@@ -1,4 +1,5 @@
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 from fastapi.responses import JSONResponse
@@ -19,19 +20,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Suitability Copilot")
-
-app.include_router(accounts.router)
-app.include_router(reviews.router)
-
-
-@app.on_event("startup")
-def log_active_provider() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     """Make it unambiguous which reviewer is backing this deployment."""
     try:
         logger.info("Review provider active: %s", get_provider().model_version)
     except Exception as exc:  # pragma: no cover - configuration error
         logger.error("Review provider misconfigured: %s", exc)
+    yield
+
+
+app = FastAPI(title="AI Suitability Copilot", lifespan=lifespan)
+
+app.include_router(accounts.router)
+app.include_router(reviews.router)
 
 
 @app.get("/health")
